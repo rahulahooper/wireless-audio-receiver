@@ -876,7 +876,7 @@ void setup_i2s(i2s_chan_handle_t* i2sHandle, i2s_chan_handle_t* i2sComHandle, co
         .clk_cfg = 
         {
             .sample_rate_hz = 48000, //sampleRate,
-            .clk_src = I2S_CLK_SRC_DEFAULT,
+            .clk_src = I2S_CLK_SRC_APLL,
             .mclk_multiple = I2S_MCLK_MULTIPLE_192,
         },
 
