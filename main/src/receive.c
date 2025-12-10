@@ -1,143 +1,30 @@
-/* BSD Socket API Example
+/*
+ * receive_task.c
+ *
+ * The receive task is responsible for receiving audio
+ * packets from a Wifi client. This task periodically
+ * exchanges data with the playback task using double-
+ * buffering. Specifically, the receive task loads audio
+ * data into a "backBuffer". When the playback task signals 
+ * that it needs new data, the receive task moves data 
+ * from the back buffer to the "activeBuffer". It then 
+ * signals to the playback task that new data is available.
+ * 
+ */
 
+#include "receive.h"
 
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
+extern SharedBuffer* activeBuffer;                     // transmitting task transmits this packet  
+extern SharedBuffer* backBuffer;                       // sampling task fills this packet         
 
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
-#include <string.h>
-#include <sys/param.h>
+extern const UBaseType_t playbackDoneNotifyIndex;      // set by the playback task when it is done processing audio data
+extern const UBaseType_t dataReadyNotifyIndex;         // set by the receive task when there is new data available for the playback task
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
+extern TaskHandle_t playbackTaskHandle;
 
-#include "esp_system.h"
-#include "esp_wifi.h"
-#include "esp_wifi_types_generic.h"
-#include "esp_mac.h"
-#include "esp_event.h"
-#include "esp_log.h"
-#include "nvs_flash.h"
-#include "esp_netif.h"
+static ReceiveTaskState_t receiveTaskState;
 
-#include "driver/dac_continuous.h"
-#include "driver/i2s_std.h"
-#include "driver/gpio.h"
-
-#include "lwip/err.h"
-#include "lwip/sockets.h"
-#include "lwip/sys.h"
-#include <lwip/netdb.h>
-
-#include "protocol_examples_common.h"
-#include "example_audio_file.h"
-#include "util.h"
-
-// -------- Local definitions and macros -------- //
-
-#define PORT CONFIG_EXAMPLE_PORT
-#define EXAMPLE_ESP_WIFI_SSID       "AudioRelayNetwork"
-#define EXAMPLE_ESP_WIFI_PASS       "AudioRelayNetworkPassword"
-#define EXAMPLE_ESP_WIFI_CHANNEL    1
-#define EXAMPLE_MAX_STA_CONN        5
-
-#define WIFI_STATION_CONNECT_MAXIMUM_RETRIES  10
-#define WIFI_EVENT_AP_STACONNECTED_BIT        BIT0     // a wifi station connected to this device
-#define WIFI_EVENT_AP_STADISCONNECTED_BIT     BIT1     // a wifi station disconnected from this device
-
-#define ESP_CORE_0      0       // physical core 0
-#define ESP_CORE_1      1       // physical core 1
-
-#define AUDIO_PACKET_MAX_SAMPLES 300                   // maximum amount of audio data we can receive from client at a time
-#define AUDIO_PACKET_BYTES_PER_SAMPLE 3                // size of each sample within an audio packet in bytes
-
-// #define DEBUG
-#ifdef DEBUG
-    #define PRINTF_DEBUG( msg ) ESP_LOGI msg
-#else
-    #define PRINTF_DEBUG( msg )
-#endif
-
-typedef enum ReceiveTaskState_t
-{
-    RECEIVE_TASK_STATE_SETUP_WIFI_DRIVER,        // Setup Wifi driver
-    RECEIVE_TASK_STATE_SETUP_SERVER,             // Set up UDP socket server
-    RECEIVE_TASK_STATE_WAIT_FOR_CLIENT,          // Wait for a client to connect
-    RECEIVE_TASK_STATE_RECEIVE_FROM_CLIENT,       // Stream data from the client
-    RECEIVE_TASK_STATE_STREAM_FROM_BUFFER,       // (For debug) Stream data from a buffer
-} ReceiveTaskState_t;
-
-static ReceiveTaskState_t gReceiveTaskState;     // global state object
-
-typedef struct ReceiveTaskConfig_t
-{
-    bool             streamFromBuffer;        // get from audio data from file
-    const int32_t*   buffer;                  // buffer to get audio from (ignored if .streamFromBuffer is false)
-    uint32_t         bufferSize;              // size of buffer
-
-    uint8_t  maxPacketTimeoutsPerConnection;        // number of timeouts before we assume the client disconnected
-
-} ReceiveTaskConfig_t;
-
-static ReceiveTaskConfig_t receiveTaskConfig = {
-    .streamFromBuffer = false,
-    .buffer           = audio_table_500hz,
-    .bufferSize       = audio_table_500hz_size,
-    .maxPacketTimeoutsPerConnection = 3, 
-};
-
-typedef struct PlaybackTaskConfig_t
-{
-    uint32_t sampleRate;            // sampling rate for digital-to-analog converter (Hz)
-    bool     useExternalDac;        // if false, configures the ESP32 built-in DAC
-    uint32_t dataBitWidth;          // number of bits per audio sample
-} PlaybackTaskConfig_t;
-
-PlaybackTaskConfig_t playbackTaskConfig = {
-    .sampleRate = 48000,
-    .useExternalDac = true,
-};
-
-typedef struct AudioPacket_t
-{
-    uint16_t seqnum;
-    bool     echo;                  // client requested an echo from server
-    uint16_t numSamples;            // number of 16-bit samples in payload
-    uint16_t payloadStart;
-    uint16_t checksum;              // crc-16
-    uint8_t  payload[AUDIO_PACKET_MAX_SAMPLES * AUDIO_PACKET_BYTES_PER_SAMPLE];
-} AudioPacket_t;
-
-static const size_t AUDIO_PACKET_HEADER_SIZE = sizeof(AudioPacket_t) - AUDIO_PACKET_MAX_SAMPLES * AUDIO_PACKET_BYTES_PER_SAMPLE;
-static const char *TAG = "wifi_ap";
-
-/* FreeRTOS event group to signal when a client is connected or disconnected */
-static EventGroupHandle_t s_wifi_event_group;
-
-#define PLAYBACK_TASK_REQ_SAMPLES         AUDIO_PACKET_MAX_SAMPLES
-#define PLAYBACK_TASK_DESIRED_SAMPLES     (uint16_t)(PLAYBACK_TASK_REQ_SAMPLES * 1.5)
-#define SHARED_BUFFER_MAX_SAMPLES         (12 * AUDIO_PACKET_MAX_SAMPLES)     // SharedBuffer is guaranteed to be able to accommodate this many samples
-
-typedef struct SharedBuffer
-{
-    uint16_t payloadStart;
-    uint16_t numSamples;                   // number of audio samples within the payload (TODO: rename to numSamples)
-    uint16_t sampleSizeBytes;              // the size of each sample within the payload, in bytes
-    uint8_t* payload;
-} SharedBuffer;
-
-static SharedBuffer gSharedBuffer[2];
-static SharedBuffer* activeBuffer;               // transmitting task transmits this packet
-static SharedBuffer* backBuffer;           // sampling task fills this packet
-
-static const UBaseType_t playbackDoneNotifyIndex = 0;      // set by the playback task when it is done processing audio data
-static const UBaseType_t dataReadyNotifyIndex;             // set by the receive task when there is new data available for the playback task
-
-static TaskHandle_t receiveTaskHandle = NULL;
-static TaskHandle_t playbackTaskHandle = NULL;
+static EventGroupHandle_t s_wifi_event_group;          // FreeRTOS event group to signal when a client is connected or disconnected
 
 ////////////////////////////////////////////////////////////////////
 // wifi_setup_driver()
@@ -145,14 +32,14 @@ static TaskHandle_t playbackTaskHandle = NULL;
 ////////////////////////////////////////////////////////////////////
 esp_err_t wifi_setup_driver(wifi_init_config_t* cfg)
 {
-    ESP_LOGI(TAG, "%s: Setting up WiFi driver\n", __func__);        
+    ESP_LOGI(__func__, "Setting up WiFi driver\n");        
 
     esp_netif_create_default_wifi_sta();            // Setup wifi station for SNTP connection
     esp_netif_create_default_wifi_ap();             // Setup wifi access point
 
     ESP_ERROR_CHECK(esp_wifi_init(cfg));
 
-    gReceiveTaskState = RECEIVE_TASK_STATE_SETUP_SERVER;
+    receiveTaskState = RECEIVE_TASK_STATE_SETUP_SERVER;
 
     return ESP_OK;
 }
@@ -167,17 +54,17 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 {
     if (event_base != WIFI_EVENT && event_base != IP_EVENT)
     {
-        ESP_LOGE(TAG, "%s received an event that it isn't supposed to handle: %s\n", __func__, event_base);
+        ESP_LOGE(__func__, "received an event that it isn't supposed to handle: %s\n", event_base);
         return;
     }
 
-    ESP_LOGI(TAG, "%s Handling event %ld\n", __func__, event_id);
+    ESP_LOGI(__func__, "Handling event %ld\n", event_id);
     switch (event_id)
     {
         case WIFI_EVENT_AP_STACONNECTED:
         {
             wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
-            ESP_LOGI(TAG, "station "MACSTR" join, AID=%d",
+            ESP_LOGI(__func__, "station "MACSTR" join, AID=%d",
                     MAC2STR(event->mac), event->aid);
 
             xEventGroupSetBits(s_wifi_event_group, WIFI_EVENT_AP_STACONNECTED_BIT);
@@ -186,10 +73,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         case WIFI_EVENT_AP_STADISCONNECTED:
         {
             wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
-            ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d, reason=%d",
+            ESP_LOGI(__func__, "station "MACSTR" leave, AID=%d, reason=%d",
                     MAC2STR(event->mac), event->aid, event->reason);
 
-            gReceiveTaskState = RECEIVE_TASK_STATE_WAIT_FOR_CLIENT;
+            receiveTaskState = RECEIVE_TASK_STATE_WAIT_FOR_CLIENT;
             
             // TODO: Need to check if there are any resources we need to clean up when
             //       a client disconnects (ie. socket descriptors, Wifi resources, etc.)
@@ -249,8 +136,8 @@ esp_err_t _wifi_softap_start()
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "%s finished. SSID:%s password:%s channel:%d",
-            __func__, EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS, EXAMPLE_ESP_WIFI_CHANNEL);
+    ESP_LOGI(__func__, "Wifi access point created. SSID:%s password:%s channel:%d",
+            EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS, EXAMPLE_ESP_WIFI_CHANNEL);
     
     return ESP_OK;
 }
@@ -267,7 +154,7 @@ esp_err_t setup_server(int addr_family, struct sockaddr_in* dest_addr, int* sock
 
     // Set up socket address information
     if (addr_family != AF_INET) {
-        ESP_LOGE(TAG, "%s:%u: Only supporting IPV4 addresses. Received %u\n", __func__, __LINE__, addr_family);
+        ESP_LOGE(__func__, "Only supporting IPV4 addresses. Received %u\n", addr_family);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -279,10 +166,10 @@ esp_err_t setup_server(int addr_family, struct sockaddr_in* dest_addr, int* sock
     int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
 
     if (sock < 0) {
-        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        ESP_LOGE(__func__, "Unable to create socket: errno %d", errno);
     }
 
-    ESP_LOGI(TAG, "Socket created!!\n");
+    ESP_LOGI(__func__, "Socket created!!\n");
 
 #if defined(CONFIG_LWIP_NETBUF_RECVINFO) && !defined(CONFIG_EXAMPLE_IPV6)
     int enable = 1;
@@ -307,13 +194,13 @@ esp_err_t setup_server(int addr_family, struct sockaddr_in* dest_addr, int* sock
 
     int err = bind(sock, (struct sockaddr *)dest_addr, sizeof(struct sockaddr));
     if (err < 0) {
-        ESP_LOGE(TAG, "Socket unable to bind: errno %d, err %d", errno, err);
+        ESP_LOGE(__func__, "Socket unable to bind: errno %d, err %d", errno, err);
         return -1;
     }
-    ESP_LOGI(TAG, "Socket bound, port %d", PORT);
+    ESP_LOGI(__func__, "Socket bound, port %d", PORT);
 
     *sockFd = sock;
-    gReceiveTaskState = RECEIVE_TASK_STATE_WAIT_FOR_CLIENT;
+    receiveTaskState = RECEIVE_TASK_STATE_WAIT_FOR_CLIENT;
     return ESP_OK;
 }
 
@@ -512,7 +399,7 @@ esp_err_t stream_from_buffer(const int32_t* buffer, const uint32_t bufferSize)
 
     while (playbackTaskHandle == NULL)
     {
-        ESP_LOGI(TAG, "%s Waiting for playback task to come up\n", __func__);
+        ESP_LOGI(__func__, "Waiting for playback task to come up\n");
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
@@ -589,7 +476,7 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
 
     while (playbackTaskHandle == NULL)
     {
-        ESP_LOGI(TAG, "%s Waiting for playback task to come up\n", __func__);
+        ESP_LOGI(__func__, "Waiting for playback task to come up\n");
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
@@ -617,13 +504,13 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
             {
                 if (errno == EWOULDBLOCK && ++numPacketTimeouts < maxPacketTimeouts)
                 {
-                    ESP_LOGE(TAG, "%s recvfrom timed out but continuing\n", __func__);
+                    ESP_LOGE(__func__, "Socket timeout (%lu / %u)\n", numPacketTimeouts, maxPacketTimeouts);
                     expectedSeqnum = 0;
                     continue;
                 }
                 else
                 {
-                    ESP_LOGE(TAG, "%s recvfrom failed: errno %d (%s)", __func__, errno, strerror(errno));
+                    ESP_LOGE(__func__, "Socket read failure: errno %d (%s)", errno, strerror(errno));
                     error = true;
                     break;
                 }
@@ -640,7 +527,7 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
                 inet_ntoa_r(((struct sockaddr_in *)&client_addr)->sin_addr, client_addr_str, sizeof(client_addr_str) - 1);
                 client_addr_str[sizeof(client_addr_str)-1] = 0;
 
-                ESP_LOGI(TAG, "%s Connected to client with IP address %s\n", __func__, client_addr_str);
+                ESP_LOGI(__func__, "Connected to client with IP address %s\n", client_addr_str);
             }
 
             int64_t timerecv;
@@ -656,14 +543,14 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
                 continue;
             }
 
-            PRINTF_DEBUG((TAG, "%s: Successfully received packet with checksum 0x%x, seqnum %u, payload size %u\n", 
-                __func__, audioPacket.checksum, audioPacket.seqnum, audioPacket.numSamples));
+            PRINTF_DEBUG((__func__, "Successfully received packet with checksum 0x%x, seqnum %u, payload size %u\n", 
+                audioPacket.checksum, audioPacket.seqnum, audioPacket.numSamples));
             
             // Copy packet into the background buffer
             bool overflow = false;
             copy_audio_packet_to_back_buffer(&audioPacket, backBuffer, &overflow);
 
-            PRINTF_DEBUG((TAG, "%s back buffer size = %u\n", __func__, backBuffer->numSamples));
+            PRINTF_DEBUG((__func__, "back buffer size = %u\n", backBuffer->numSamples));
 
             // if the client requested it, echo the packet back
             // TODO: Defer this to immediately after we have 
@@ -671,14 +558,14 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
             if (audioPacket.echo)
             {
 
-                ESP_LOGI(TAG, "%s: Echoing back packet with checksum 0x%x, seqnum %u, payload size %u.\n", 
-                    __func__, audioPacket.checksum, audioPacket.seqnum, audioPacket.numSamples);
+                ESP_LOGI(__func__, "Echoing back packet with checksum 0x%x, seqnum %u, payload size %u.\n", 
+                    audioPacket.checksum, audioPacket.seqnum, audioPacket.numSamples);
 
                 int err = sendto(sock, (void*)&audioPacket, AUDIO_PACKET_HEADER_SIZE, 0, (struct sockaddr*)&client_addr, sockaddr_len);
 
                 if (err < 0)
                 {
-                    ESP_LOGE(TAG, "%s: Error sending sending response to client at address %s. errno = %s\n", __func__, client_addr_str, strerror(errno));
+                    ESP_LOGE(__func__, "Error sending sending response to client at address %s. errno = %s\n", client_addr_str, strerror(errno));
                     error = true;
                 }
             }
@@ -712,7 +599,7 @@ esp_err_t stream_from_client(const int sock, const int maxPacketTimeouts)
 // receive_task_main()
 //
 ////////////////////////////////////////////////////////////////////
-static void receive_task_main(void *pvParameters)
+void receive_task_main(void *pvParameters)
 {
     ReceiveTaskConfig_t receiveTaskConfig = *(ReceiveTaskConfig_t*)pvParameters;
     ESP_LOGI(__func__, "Receive task ready\n");
@@ -728,11 +615,11 @@ static void receive_task_main(void *pvParameters)
     // Initialize receive task state machine
     if (receiveTaskConfig.streamFromBuffer)
     {
-        gReceiveTaskState = RECEIVE_TASK_STATE_STREAM_FROM_BUFFER;
+        receiveTaskState = RECEIVE_TASK_STATE_STREAM_FROM_BUFFER;
     }
     else
     {
-        gReceiveTaskState = RECEIVE_TASK_STATE_SETUP_WIFI_DRIVER;     
+        receiveTaskState = RECEIVE_TASK_STATE_SETUP_WIFI_DRIVER;     
     }
 
     // Handle receive task state machine
@@ -740,7 +627,7 @@ static void receive_task_main(void *pvParameters)
     while (1) 
     {
 
-        switch(gReceiveTaskState)
+        switch(receiveTaskState)
         {
             case RECEIVE_TASK_STATE_SETUP_WIFI_DRIVER:
             {
@@ -766,8 +653,8 @@ static void receive_task_main(void *pvParameters)
                 
                 if (bits & WIFI_EVENT_AP_STACONNECTED_BIT)
                 {
-                    ESP_LOGI(TAG, "%s Client connected!\n", __func__);
-                    gReceiveTaskState = RECEIVE_TASK_STATE_RECEIVE_FROM_CLIENT;
+                    ESP_LOGI(__func__, "Client connected!\n");
+                    receiveTaskState = RECEIVE_TASK_STATE_RECEIVE_FROM_CLIENT;
                 }
                 break;
             }
@@ -777,7 +664,7 @@ static void receive_task_main(void *pvParameters)
                 // This only returns if a client disconnects
                 ESP_ERROR_CHECK(stream_from_client(sock, receiveTaskConfig.maxPacketTimeoutsPerConnection));
                 
-                gReceiveTaskState = RECEIVE_TASK_STATE_WAIT_FOR_CLIENT;
+                receiveTaskState = RECEIVE_TASK_STATE_WAIT_FOR_CLIENT;
                 break;
             }
 
@@ -796,7 +683,7 @@ static void receive_task_main(void *pvParameters)
             }
             default:
             {
-                ESP_LOGE(TAG, "%s Entered unknown state %u\n", __func__, gReceiveTaskState);
+                ESP_LOGE(__func__, "Entered unknown state %u\n", receiveTaskState);
                 break;
             }
         }
@@ -804,352 +691,3 @@ static void receive_task_main(void *pvParameters)
     vTaskDelete(NULL);
 }
 
-
-////////////////////////////////////////////////////////////////////
-// dac_on_convert_done_callback()
-//
-////////////////////////////////////////////////////////////////////
-static bool IRAM_ATTR  dac_on_convert_done_callback(dac_continuous_handle_t handle, const dac_event_data_t *event, void *user_data)
-{
-    QueueHandle_t que = (QueueHandle_t)user_data;
-    BaseType_t need_awoke;
-    /* When the queue is full, drop the oldest item */
-    if (xQueueIsQueueFullFromISR(que)) {
-        dac_event_data_t dummy;
-        xQueueReceiveFromISR(que, &dummy, &need_awoke);
-    }
-    /* Send the event from callback */
-    xQueueSendFromISR(que, event, &need_awoke);
-    return need_awoke;
-}
-
-
-////////////////////////////////////////////////////////////////////
-// setup_dac()
-//
-////////////////////////////////////////////////////////////////////
-void setup_dac(QueueHandle_t* queue, dac_continuous_handle_t* dacHandle, const uint32_t sampleRate)
-{
-    // Allocate resources for queue
-    *queue = xQueueCreate(10, sizeof(dac_event_data_t));
-    assert(*queue);
-
-    // Allocate resources for DAC
-    dac_continuous_config_t dacConfig = 
-    {
-        .chan_mask  = DAC_CHANNEL_MASK_CH0,
-        .desc_num   = 4,
-        .buf_size   = PLAYBACK_TASK_REQ_SAMPLES,    // each sample is 1 byte
-        .freq_hz    = sampleRate,
-        .offset     = 0,
-        .clk_src    = DAC_DIGI_CLK_SRC_APLL,
-        .chan_mode  = DAC_CHANNEL_MODE_SIMUL,        // not necessary for our purposes
-    };
-
-    ESP_ERROR_CHECK(dac_continuous_new_channels(&dacConfig, dacHandle));
-
-    // Register a callback for when the DAC has converted previously loaded data
-    dac_event_callbacks_t dacCallback =
-    {
-        .on_convert_done = dac_on_convert_done_callback,
-        .on_stop         = NULL,
-    };
-
-    ESP_ERROR_CHECK(dac_continuous_register_event_callback(*dacHandle, &dacCallback, *queue));
-    ESP_ERROR_CHECK(dac_continuous_enable(*dacHandle));
-    ESP_ERROR_CHECK(dac_continuous_start_async_writing(*dacHandle));
-}
-
-
-////////////////////////////////////////////////////////////////////
-// setup_i2s()
-//
-////////////////////////////////////////////////////////////////////
-void setup_i2s(i2s_chan_handle_t* i2sHandle, i2s_chan_handle_t* i2sComHandle, const uint32_t sampleRate)
-{
-    // Configure the I2S channel
-    i2s_chan_config_t i2sChanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    i2s_new_channel(&i2sChanConfig, i2sHandle, NULL);
-
-    i2s_std_config_t i2sStdConfig = 
-    {
-        .clk_cfg = 
-        {
-            .sample_rate_hz = 48000, //sampleRate,
-            .clk_src = I2S_CLK_SRC_APLL,
-            .mclk_multiple = I2S_MCLK_MULTIPLE_192,
-        },
-
-        .slot_cfg =
-        {
-            .data_bit_width = I2S_DATA_BIT_WIDTH_24BIT,   // The PCM1753 defaults to 24-bit left-justified I2S. Therefore,
-                                                          //  any data we load into the I2S buffer must be zero-extended to be 24-bits
-            .slot_bit_width = I2S_DATA_BIT_WIDTH_24BIT, 
-            .slot_mode      = I2S_SLOT_MODE_MONO,         // The PCM1753 expects two channels, but we only have one
-                                                          //  channel's worth of data. The I2S TX buffer will duplicate
-                                                          //  the data onto the second channel.
-            .slot_mask      = I2S_STD_SLOT_BOTH,          // The PCM1753 expects two channels
-            .ws_width       = I2S_DATA_BIT_WIDTH_24BIT,   // WS should be high for the entirety of a slot
-            .bit_shift      = false,                      // The PCM1753 defaults to 24-bit left-justified I2S, which as no bit shift.
-            .msb_right      = false,                      // ¯\_(ツ)_/¯
-
-        },
-
-        .gpio_cfg = 
-        {
-            .mclk = GPIO_NUM_0,
-            .bclk = GPIO_NUM_12,
-            .ws   = GPIO_NUM_27,
-            .dout = GPIO_NUM_14,
-            .din  = I2S_GPIO_UNUSED,
-            .invert_flags =
-            {
-                .bclk_inv = false,
-                .mclk_inv = false,
-                .ws_inv   = true,                       // The PCM1753 asserts WS for the left channel and 
-                                                        //  de-asserts WS for the right channel
-            }
-        }
-    };
-
-    // Initialize and enable the channels
-    i2s_channel_init_std_mode(*i2sHandle, &i2sStdConfig);
-    i2s_channel_enable(*i2sHandle);         
-
-    // The I2S is now running and sending data to the PCM1753
-
-    vTaskDelay(100);
-}
-
-////////////////////////////////////////////////////////////////////
-// destroy_dac()
-//
-////////////////////////////////////////////////////////////////////
-void destroy_dac(bool useExternalDac, dac_continuous_handle_t* dacHandle, 
-                 QueueHandle_t* dacQueue, i2s_chan_handle_t* i2sHandle)
-{
-    if (useExternalDac)
-    {
-        // Stop i2s channel
-        ESP_ERROR_CHECK(i2s_channel_disable(*i2sHandle));
-
-        // Delete i2s channel
-        ESP_ERROR_CHECK(i2s_del_channel(*i2sHandle));
-    }
-    else
-    {
-        // Stop dac conversions
-        ESP_ERROR_CHECK(dac_continuous_disable(*dacHandle));
-
-        // Free dac resources
-        ESP_ERROR_CHECK(dac_continuous_del_channels(*dacHandle));
-
-        // Free queue resouces
-        vQueueDelete(*dacQueue);
-    }
-}
-
-
-////////////////////////////////////////////////////////////////////
-// playback_task_main()
-//
-////////////////////////////////////////////////////////////////////
-void playback_task_main(void* pvParameters)
-{
-    PlaybackTaskConfig_t playbackTaskConfig = *(PlaybackTaskConfig_t*)pvParameters;
-
-    ESP_LOGI(TAG, "%s Playback task ready\n", __func__);
-    while (receiveTaskHandle == NULL)
-    {
-        ESP_LOGI(TAG, "%s Waiting for receive task to come up\n", __func__);
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-
-    // Setup the digital-to-analog converter (dac)
-    QueueHandle_t dacQueue;                 // shared between intenal and external DACs
-    dac_continuous_handle_t dacHandle;      // handle for internal DAC
-    i2s_chan_handle_t i2sHandle;            // handle for external DAC (PCM1753)
-    i2s_chan_handle_t i2sComHandle;
-    if (playbackTaskConfig.useExternalDac)
-    {
-        setup_i2s(&i2sHandle, &i2sComHandle, playbackTaskConfig.sampleRate);
-    }
-    else
-    {
-        setup_dac(&dacQueue, &dacHandle, playbackTaskConfig.sampleRate);
-    }
-
-    bool error = false;
-
-    while (!error)
-    {
-        // Notify the receive task that we are waiting for new data
-        PRINTF_DEBUG((__func__, "%s Notifying receive task of playback done\n"));
-        xTaskNotifyGiveIndexed(receiveTaskHandle, playbackDoneNotifyIndex);
-
-        // Wait for new data
-        while (!ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
-        {
-            vTaskDelay(1);
-        }
-
-        PRINTF_DEBUG((__func__, "Got data ready notification.\n"));
-
-        // Verify the new data
-        //  1. Check whether the playback task has provided enough data to start playback
-        //  2. Ensure that the data within the active buffer starts at index 0
-
-        if (activeBuffer->numSamples < PLAYBACK_TASK_REQ_SAMPLES)
-        {
-            ESP_LOGE(__func__, "Received insufficient data from receive_task: %u / %u bytes\n",
-                activeBuffer->numSamples, PLAYBACK_TASK_REQ_SAMPLES);
-            continue;
-        } 
-        else if (activeBuffer->payloadStart != 0)
-        {
-            ESP_LOGE(__func__, "active buffer data doesn't start at idx 0 (%u). Not playing data\n",
-                activeBuffer->payloadStart);
-            activeBuffer->numSamples = 0;
-            activeBuffer->payloadStart = 0;
-            continue;
-        }
-
-        // Send data from active buffer to DAC
-        if (playbackTaskConfig.useExternalDac)
-        {
-            i2s_event_data_t eventData;
-            (void)eventData;
-            assert(activeBuffer->sampleSizeBytes == sizeof(uint32_t));
-
-            esp_err_t ret = ESP_OK;
-
-            int64_t start, stop;
-            get_system_time(&start);
-            while (activeBuffer->numSamples > PLAYBACK_TASK_REQ_SAMPLES && ret == ESP_OK)
-            {
-                size_t bytesWritten;
-                uint32_t timeoutMs = 100;
-
-                ret = i2s_channel_write(i2sHandle, 
-                                  activeBuffer->payload + activeBuffer->payloadStart, 
-                                  activeBuffer->numSamples * activeBuffer->sampleSizeBytes, 
-                                  &bytesWritten, timeoutMs);
-                activeBuffer->payloadStart += bytesWritten;
-                activeBuffer->numSamples  -= (bytesWritten >> 2);   // 1 sample = 4 bytes
-            }
-
-            if (ret != ESP_OK)
-            {
-                get_system_time(&stop);
-                ESP_LOGE(__func__, "Error during I2s Write: %s. Read %u bytes in %llu microseconds.\n",
-                    esp_err_to_name(ret), activeBuffer->payloadStart, (stop - start));
-            }
-
-        }
-        else
-        {
-            // Use the internal ESP32 DAC
-            dac_event_data_t eventData;
-            assert(activeBuffer->sampleSizeBytes == sizeof(uint8_t));
-
-            while (activeBuffer->numSamples > PLAYBACK_TASK_REQ_SAMPLES)
-            {
-                xQueueReceive(dacQueue, &eventData, portMAX_DELAY);
-                size_t loadedBytes = 0;
-                ESP_ERROR_CHECK(dac_continuous_write_asynchronously(dacHandle, eventData.buf, eventData.buf_size,
-                                                                    &activeBuffer->payload[activeBuffer->payloadStart],
-                                                                    activeBuffer->numSamples * activeBuffer->sampleSizeBytes, 
-                                                                    &loadedBytes));
-
-                activeBuffer->payloadStart += MIN(loadedBytes, activeBuffer->numSamples);
-                activeBuffer->numSamples  -= MIN(loadedBytes, activeBuffer->numSamples);
-            }
-        }
-    }
-
-    // We should never reach here
-    destroy_dac(playbackTaskConfig.useExternalDac, &dacHandle, &dacQueue, &i2sHandle);
-    vTaskDelete(NULL);
-}
-
-////////////////////////////////////////////////////////////////////
-// init_shared_buffers()
-//
-////////////////////////////////////////////////////////////////////
-void init_shared_buffers(bool useExternalDac)
-{
-    // Initialize the active buffer
-    activeBuffer = &gSharedBuffer[0];
-    activeBuffer->payloadStart = 0;
-    activeBuffer->numSamples = 0;
-
-    // The external dac requires 32-bit samples, the internal dac requires 8-bit samples
-    activeBuffer->sampleSizeBytes = useExternalDac ? sizeof(uint32_t) : sizeof(uint8_t);
-
-    activeBuffer->payload = (uint8_t*)malloc(SHARED_BUFFER_MAX_SAMPLES * activeBuffer->sampleSizeBytes);
-    memset(activeBuffer->payload, 0, SHARED_BUFFER_MAX_SAMPLES * activeBuffer->sampleSizeBytes);
-
-    // Initialize the back buffer
-    backBuffer = &gSharedBuffer[1];
-    backBuffer->payloadStart = 0;
-    backBuffer->numSamples = 0;
-
-    // The samples we send over Wifi are 24-bit
-    backBuffer->sampleSizeBytes = AUDIO_PACKET_BYTES_PER_SAMPLE;
-
-    backBuffer->payload = (uint8_t*)malloc(SHARED_BUFFER_MAX_SAMPLES * backBuffer->sampleSizeBytes);
-    memset(backBuffer->payload, 0, SHARED_BUFFER_MAX_SAMPLES * backBuffer->sampleSizeBytes);
-}
-
-
-////////////////////////////////////////////////////////////////////
-// app_main()
-//
-////////////////////////////////////////////////////////////////////
-void app_main(void)
-{
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(nvs_flash_init());
-
-    #ifdef CONFIG_LWIP_DHCP_GET_NTP_SRV
-    ESP_LOGI(TAG, "%s LWIP config'd\n", __func__);
-    #endif
-
-    init_shared_buffers(playbackTaskConfig.useExternalDac);
-
-    // Create "receive" task
-    // 
-    // The receive task is responsible for receiving audio
-    // packets from a client. The receive task will populate
-    // a back buffer that is invisible to the playback
-    // task until the playback task signals that it needs new data.
-    // At this point, the receive task moves data from the back
-    // buffer to the front buffer and signals to the receive task
-    // that new data is available.
-
-    BaseType_t receiveTaskStatus = xTaskCreatePinnedToCore(receive_task_main, "receive_task", 8192, &receiveTaskConfig, 5, &receiveTaskHandle, ESP_CORE_0);
-
-    if (receiveTaskStatus != pdPASS)
-    {
-        ESP_LOGE(TAG, "%s Failed to create receive task!\n", __func__);
-        return;
-    }
-
-    // Create "playback" task
-    //
-    // The playback task is responsible for converting the
-    // audio data in a front buffer to analog and driving
-    // the amplifier circuit. When it is out of data, the 
-    // playback task will notify the receive task and block
-    // until there is new data available.
-
-    BaseType_t playbackTaskStatus = xTaskCreatePinnedToCore(playback_task_main, "playback_task", 8192, &playbackTaskConfig, 5, &playbackTaskHandle, ESP_CORE_1);
-
-    if (playbackTaskStatus != pdPASS)
-    {
-        ESP_LOGE(TAG, "%s Failed to create playback task!\n", __func__);
-        return;
-    }
-
-}
