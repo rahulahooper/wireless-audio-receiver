@@ -1,16 +1,17 @@
-/*
- * receive_task.c
- *
- * The receive task is responsible for receiving audio
- * packets from a Wifi client. This task periodically
- * exchanges data with the playback task using double-
- * buffering. Specifically, the receive task loads audio
- * data into a "backBuffer". When the playback task signals 
- * that it needs new data, the receive task moves data 
- * from the back buffer to the "activeBuffer". It then 
- * signals to the playback task that new data is available.
- * 
- */
+//////////////////////////////////////////////////////////////
+///
+/// receive_task.c
+///
+/// The receive task is responsible for receiving audio
+/// packets from a Wifi client. This task periodically
+/// exchanges data with the playback task using double-
+/// buffering. Specifically, the receive task loads audio
+/// data into a "backBuffer". When the playback task signals 
+/// that it needs new data, the receive task moves data 
+/// from the back buffer to the "activeBuffer". It then 
+/// signals to the playback task that new data is available.
+/// 
+//////////////////////////////////////////////////////////////
 
 #include "receive.h"
 
