@@ -6,7 +6,7 @@
 </figure>
 <br><br>
 
-This repo is one half of a wireless audio streaming system between two ESP32s. The code here specifically implements the receiving side of the wireless system. This includes forwarding audio data to the amplifier.
+This repo is one half of a wireless audio streaming system between two ESP32s. The goal of this repo and the [transmitting side](https://github.com/rahulahooper/wireless-audio-transmitter) of the wireless system is to stream audio from a guitar to an amplifier without having a physical cable between the two. The code here specifically implements the receiving side of the wireless system. This includes forwarding audio data to the amplifier.
 
 The receiver software consists of two threads (or tasks, in FreeRTOS lingo): the receive task and the playback task. 
 
