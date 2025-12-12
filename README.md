@@ -30,12 +30,12 @@ I've played around with the caching and made it as small as possible while maint
 To compute the theoretical latency of this wireless system, we need to consider:
 
   1) The amount of time a sample is cached in the transmitting ESP32 before it is sent to the Wifi driver. Samples are cached while the [sampling task](https://github.com/rahulahooper/wireless-audio-transmitter/tree/main?tab=readme-ov-file#wireless-audio-transmitter) assembles an audio packet.
-    - A sample is cached for _size_of_audio_packet_ / _sampling_rate_ = 300 / 48000 = 6.25ms
+      - A sample is cached for _size_of_audio_packet_ / _sampling_rate_ = 300 / 48000 = 6.25ms
   2)  The time it takes for the ESP32s to communicate the data
-    - By having the receiving ESP32 periodically echo packets back to the transmitter, we can compute the round-trip time of the wireless communication. 
-    - This has been computed to be roughly 3ms --> 1.5ms for one-way communication
+      - By having the receiving ESP32 periodically echo packets back to the transmitter, we can compute the round-trip time of the wireless communication. 
+      - This has been computed to be roughly 3ms --> 1.5ms for one-way communication
   3) The amount of time a sample is cached in the receiving ESP32 before it is sent to the DAC
-    - The receive task caches roughly one additional buffer of data. This means that when a sample arrives at the receiving ESP32, it must wait for another packet to arrive (another 6.25ms later). 
+      - The receive task caches roughly one additional buffer of data. This means that when a sample arrives at the receiving ESP32, it must wait for another packet to arrive (another 6.25ms later). 
 
 **The theoretical total latency of the audio system, then, is roughly 14ms.** I personally don't notice the latency, but if other people do, it should be possible to further reduce the latency by reducing the audio packet size. 
 
