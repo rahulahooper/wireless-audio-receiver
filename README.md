@@ -46,7 +46,7 @@ To compute the theoretical latency of this wireless system, we need to consider:
 <figure style="text-align:center; margin-bottom: 20px;">
   <img src="pcb.jpg" alt="PCB" width=500>
     <figcaption>
-    The Circuit Board (with lots of debug wires soldered on)
+    The circuit board, with lots of debug wires soldered on (ESP32 is on the back side)
   </figcaption>
 </figure>
 <br><br><br>
