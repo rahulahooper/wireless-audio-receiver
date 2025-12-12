@@ -4,6 +4,7 @@
   <img src="system_diagram.png" alt="System Diagram">
   <figcaption>System Diagram</figcaption>
 </figure>
+<br><br><br>
 
 This repo is one half of a wireless audio streaming system between two ESP32s. The code here specifically implements the receiving side of the wireless system. This includes forwarding audio data to the amplifier.
 
@@ -42,10 +43,13 @@ To compute the theoretical latency of this wireless system, we need to consider:
 
 ### Circuit
 
-<figure style="text-align:center">
-  <img src="pcb.jpg" alt="PCB">
-  <figcaption>The Circuit Board (with lots of debug wires soldered on)</figcaption>
+<figure style="text-align:center; margin-bottom: 20px;">
+  <img src="pcb.jpg" alt="PCB" width=500>
+    <figcaption>
+    The Circuit Board (with lots of debug wires soldered on)
+  </figcaption>
 </figure>
+<br><br><br>
 
 The schematic and layout of the audio receiver are included in the repo. The circuit is responsible for receiving audio data from the ESP32 (specifially, from the playback task), filtering + amplifying the data, and sending it to some kind of speaker. The circuit can drive either a low-impedance speaker (I tested with an off-the-shelf 8-ohm speaker), or it can send data to an actual guitar amplifier.
 
