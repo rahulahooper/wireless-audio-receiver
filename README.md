@@ -4,7 +4,7 @@
   <img src="system_diagram.png" alt="System Diagram">
   <figcaption>System Diagram</figcaption>
 </figure>
-<br><br><br>
+<br><br>
 
 This repo is one half of a wireless audio streaming system between two ESP32s. The code here specifically implements the receiving side of the wireless system. This includes forwarding audio data to the amplifier.
 
