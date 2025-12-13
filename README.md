@@ -74,3 +74,9 @@ The circuit has a bunch of switches on it so that we can test things like the ES
 (For reference only, only important to readers who are working with the internal ESP32 DAC).
 
 The ESP32 has an internal digital to analog converter that converts data using DMA. The user specifies the size of the DMA buffer when they first configure the DAC. To write to the DAC, the user calls the function `dac_continuous_write_asynchronously()`, providing both a pointer to the DMA buffer as well as a separate buffer containing new data. The function then copies the new data into the DMA buffer. It is important to note that the _entire_ DMA buffer is processed by the I2S controller. This means that if the new data provided does not fill up the DMA buffer, then the DMA buffer will contain both new data and stale data.  
+
+### Building the project
+
+1. Install the [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html)
+2. Compile the code:  `$ idf.py build`
+3. Flash the code onto the board: `$idf.py flash`
