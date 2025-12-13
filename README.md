@@ -34,7 +34,7 @@ To satisfy the first goal, we must ensure that the receive task always has data 
 We can think of the data received over Wifi as water flowing into a tub. The water, like the incoming audio data, flows into the tub at a variable rate. Similarly, we can think of data sent to the playback task as water draining out of the tub. This occurs at fixed rate. The tub itself represents the cache that the receive task maintains. The goal of the receive task is to maintain a steady outflow of water at all times - this means that we always want to have data available for the playback task. Because the water flows in at a variable rate, the receive task can only accomplish its goal by keeping just a little bit of water in the tub at all times. However, the more that the receive task caches audio data (ie. the longer the water sits in the tub), the greater the latency of the system.
 
 
-## Theoretical Latency
+### Theoretical Latency
 To compute the theoretical latency of this wireless system, we need to consider:
 
   1) The amount of time a sample is cached in the transmitting ESP32 before it is sent to the Wifi driver. Samples are cached while the [sampling task](https://github.com/rahulahooper/wireless-audio-transmitter/tree/main?tab=readme-ov-file#wireless-audio-transmitter) on the transmitting ESP32 assembles an audio packet.
