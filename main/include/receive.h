@@ -27,7 +27,7 @@
 ////////////////////////////////////////////////////////////////////
 
 
-#define PORT CONFIG_EXAMPLE_PORT
+#define PORT                        3333
 #define EXAMPLE_ESP_WIFI_SSID       "AudioRelayNetwork"
 #define EXAMPLE_ESP_WIFI_PASS       "AudioRelayNetworkPassword"
 #define EXAMPLE_ESP_WIFI_CHANNEL    1
