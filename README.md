@@ -20,17 +20,15 @@ When the playback task exhausts all of the data in the "front buffer", it signal
 
 ### Bathtubs
 
+<figure style="text-align:center; margin-bottom: 20px;">
+  <img src="imgs/bathtub.png" alt="bathtub" width=500>
+</figure>
+<br><br>
+
 The most important goal is to ensure that the audio fed to the amplifier is clean (ie. no distortion or discontinuities). The secondary goal is minimizing latency between the guitar and the amplfier. 
 
 To satisfy the first goal, we must ensure that the receive task always has data to forward to the playback task. If it does not have data, the playback task would either have to stall or play stale data, resulting in a distorted audio signal. The receive task avoids this waiting for several buffer's worth of data to arrive over Wifi before it starts forwarding to the playback task. An analogy I've found useful for reasoning about this stuff is water flowing into and out of a bathtub:
 
-<figure style="text-align:center; margin-bottom: 20px;">
-  <img src="imgs/bathtub.png" alt="bathtub" width=350>
-    <figcaption>
-    The circuit board, with lots of debug wires soldered on (ESP32 is on the back side)
-  </figcaption>
-</figure>
-<br><br>
 
 We can think of the data received over Wifi as water flowing into a tub. The water, like the incoming audio data, flows into the tub at a variable rate. Similarly, we can think of data sent to the playback task as water draining out of the tub. This occurs at fixed rate. The tub itself represents the cache that the receive task maintains. The goal of the receive task is to maintain a steady outflow of water at all times - this means that we always want to have data available for the playback task. Because the water flows in at a variable rate, the receive task can only accomplish its goal by keeping just a little bit of water in the tub at all times. However, the more that the receive task caches audio data (ie. the longer the water sits in the tub), the greater the latency of the system.
 
