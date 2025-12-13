@@ -22,6 +22,7 @@ When the playback task exhausts all of the data in the "front buffer", it signal
 
 <figure style="text-align:center; margin-bottom: 20px;">
   <img src="imgs/bathtub.png" alt="bathtub" width=500>
+  <figcaption>A Bathtub</figcaption>
 </figure>
 <br><br>
 
